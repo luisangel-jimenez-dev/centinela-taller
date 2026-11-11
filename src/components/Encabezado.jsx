@@ -7,7 +7,7 @@ export default function Encabezado({ generadoEn }) {
         <p className="marca">
           <span className="punto-vivo" /> CENTINELA
         </p>
-        <h1>Monitoreo sísmico de México</h1>
+        <h1>Monitoreo sísmico de México actual</h1>
       </div>
       <p className="actualizado">
         Datos actualizados {hace(generadoEn)}
