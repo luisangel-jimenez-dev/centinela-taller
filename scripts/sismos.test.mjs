@@ -33,7 +33,7 @@ const RSS_EJEMPLO = `<?xml version="1.0"?>
 
 test('lee los sismos del RSS y descarta los que vienen rotos', () => {
   const sismos = parsearRss(RSS_EJEMPLO)
-  assert.equal(sismos.length, 2)
+  assert.equal(sismos.length, 99)
 
   const [primero] = sismos
   assert.equal(primero.magnitud, 4.3)
