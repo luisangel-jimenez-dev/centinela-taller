@@ -1,0 +1,272 @@
+# ============================================================
+#  PIPELINE de Centinela: el "robot" que trabaja por nosotros
+#
+#  ¿Cuándo se ejecuta?
+#   - Pull Request a main → revisa el código y muestra el plan de Terraform
+#   - Push a main         → todo: revisa, crea infraestructura y publica
+#   - Cada hora (cron)    → solo actualiza los datos de sismos
+#   - Manual              → botón "Run workflow" en la pestaña Actions
+#
+#  Jobs:
+#   1. calidad          (CI)  lint + pruebas + compilar
+#   2. infraestructura  (IaC) terraform fmt / validate / plan / apply
+#   3. datos            (ETL) descarga sismos → S3 → limpia caché de CloudFront
+#   4. tablero          (CD)  compila React → lo publica en Amplify
+#
+#  🔒 Seguridad de la cadena de suministro:
+#   - Las acciones están fijadas a un commit exacto (SHA), no a una
+#     etiqueta como "v7" que alguien podría mover a código malicioso.
+#     El comentario "# v7.0.1" dice qué versión es.
+#   - npm ci + .npmrc: no se ejecutan scripts de instalación.
+#   - npm audit + npm audit signatures en cada cambio.
+# ============================================================
+
+name: Centinela CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 * * * *" # cada hora, en el minuto 17 (hora UTC)
+  workflow_dispatch:
+
+# Permisos mínimos del token de GitHub.
+# id-token: write → permite pedirle a AWS credenciales temporales (OIDC)
+permissions:
+  id-token: write
+  contents: read
+
+# Nunca dos ejecuciones a la vez sobre la misma rama
+# (evita que dos jobs escriban sismos.json al mismo tiempo)
+concurrency:
+  group: centinela-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VAR_alumno: ${{ vars.ALUMNO }}
+
+jobs:
+  # ----------------------------------------------------------
+  # 1. CI: ¿el código está bien?
+  # ----------------------------------------------------------
+  calidad:
+    name: "1 · Calidad (lint, pruebas, build)"
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # no dejar el token de GitHub guardado
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*   # la versión LTS más reciente
+          check-latest: true    # siempre con el último parche de seguridad
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci # usa el .npmrc: sin scripts de instalación
+
+      - name: Seguridad 1/2 (vulnerabilidades conocidas)
+        run: npm audit --audit-level=high
+
+      - name: Seguridad 2/2 (firmas de los paquetes)
+        run: npm audit signatures
+
+      - name: Revisar estilo del código (lint)
+        run: npm run lint
+
+      - name: Correr pruebas
+        run: npm test
+
+      - name: Compilar el tablero
+        run: npm run build
+
+  # ----------------------------------------------------------
+  # 2. Infraestructura con Terraform
+  # ----------------------------------------------------------
+  infraestructura:
+    name: "2 · Infraestructura (Terraform)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    # Valores que pasamos a los siguientes jobs
+    outputs:
+      bucket: ${{ steps.salidas.outputs.bucket }}
+      cdn_id: ${{ steps.salidas.outputs.cdn_id }}
+      url_datos: ${{ steps.salidas.outputs.url_datos }}
+      app_id: ${{ steps.salidas.outputs.app_id }}
+      url_tablero: ${{ steps.salidas.outputs.url_tablero }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # no dejar el token de GitHub guardado
+
+      - name: Entrar a AWS (sin contraseñas, con OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: terraform fmt (¿está bien formateado?)
+        if: github.event_name != 'schedule'
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (conectar con el estado en S3)
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform validate (¿está bien escrito?)
+        if: github.event_name != 'schedule'
+        run: terraform validate
+
+      - name: terraform plan (¿qué va a cambiar?)
+        if: github.event_name != 'schedule'
+        run: terraform plan -input=false -out=tfplan
+
+      - name: terraform apply (¡aplicar cambios!)
+        # Solo en main. En un Pull Request solo vemos el plan.
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: terraform apply -input=false tfplan
+
+      - name: Leer los outputs de Terraform
+        id: salidas
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          echo "bucket=$(terraform output -raw bucket_datos)"       >> "$GITHUB_OUTPUT"
+          echo "cdn_id=$(terraform output -raw cdn_id)"             >> "$GITHUB_OUTPUT"
+          echo "url_datos=$(terraform output -raw url_datos)"       >> "$GITHUB_OUTPUT"
+          echo "app_id=$(terraform output -raw amplify_app_id)"     >> "$GITHUB_OUTPUT"
+          echo "url_tablero=$(terraform output -raw url_tablero)"   >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------
+  # 3. Datos: Extraer → Transformar → Cargar (cada hora)
+  # ----------------------------------------------------------
+  datos:
+    name: "3 · Actualizar datos de sismos"
+    needs: infraestructura
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ needs.infraestructura.outputs.bucket }}
+      CDN_ID: ${{ needs.infraestructura.outputs.cdn_id }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # no dejar el token de GitHub guardado
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*   # la versión LTS más reciente
+          check-latest: true    # siempre con el último parche de seguridad
+
+      - name: Entrar a AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Bajar el historial que ya tenemos
+        run: aws s3 cp "s3://$BUCKET/sismos.json" public/sismos.json || echo "Primera vez, todavía no hay historial"
+
+      - name: Descargar y procesar sismos nuevos del SSN
+        run: node scripts/sismos.mjs public/sismos.json
+
+      - name: Subir sismos.json a S3
+        run: |
+          aws s3 cp public/sismos.json "s3://$BUCKET/sismos.json" \
+            --content-type "application/json" \
+            --cache-control "max-age=300"
+
+      - name: Limpiar la caché de CloudFront
+        run: aws cloudfront create-invalidation --distribution-id "$CDN_ID" --paths "/sismos.json"
+
+  # ----------------------------------------------------------
+  # 4. CD: publicar el tablero en Amplify
+  # ----------------------------------------------------------
+  tablero:
+    name: "4 · Publicar tablero (Amplify)"
+    needs: [calidad, infraestructura]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment:
+      name: produccion
+      url: ${{ needs.infraestructura.outputs.url_tablero }}
+    env:
+      APP_ID: ${{ needs.infraestructura.outputs.app_id }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # no dejar el token de GitHub guardado
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*   # la versión LTS más reciente
+          check-latest: true    # siempre con el último parche de seguridad
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Compilar el tablero con la URL de los datos
+        run: npm run build
+        env:
+          VITE_DATA_URL: ${{ needs.infraestructura.outputs.url_datos }}
+
+      - name: Empaquetar en un .zip
+        run: cd dist && zip -r ../tablero.zip .
+
+      - name: Entrar a AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Subir y publicar en Amplify
+        run: |
+          # 1) Pedirle a Amplify un lugar para subir el zip
+          RESPUESTA=$(aws amplify create-deployment --app-id "$APP_ID" --branch-name main)
+          JOB_ID=$(echo "$RESPUESTA" | jq -r .jobId)
+          URL_SUBIDA=$(echo "$RESPUESTA" | jq -r .zipUploadUrl)
+
+          # 2) Subir el zip
+          curl --fail --silent --show-error -X PUT \
+            -H "Content-Type: application/zip" \
+            --upload-file tablero.zip "$URL_SUBIDA"
+
+          # 3) Decirle a Amplify que lo publique
+          aws amplify start-deployment --app-id "$APP_ID" --branch-name main --job-id "$JOB_ID"
+
+          # 4) Esperar a que termine (máximo 5 minutos)
+          for i in $(seq 1 30); do
+            ESTADO=$(aws amplify get-job --app-id "$APP_ID" --branch-name main --job-id "$JOB_ID" \
+              --query 'job.summary.status' --output text)
+            echo "Estado de la publicación: $ESTADO"
+            case "$ESTADO" in
+              SUCCEED) echo "✅ Tablero publicado"; exit 0 ;;
+              FAILED|CANCELLED) echo "❌ Falló la publicación"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "❌ Tardó demasiado"; exit 1
+
+      - name: Resumen
+        run: |
+          echo "## 🛰️ Centinela publicado" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tablero: ${{ needs.infraestructura.outputs.url_tablero }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Datos: ${{ needs.infraestructura.outputs.url_datos }}" >> "$GITHUB_STEP_SUMMARY"

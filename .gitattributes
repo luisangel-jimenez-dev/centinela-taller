@@ -1,0 +1,4 @@
+# Finales de línea iguales en Windows, Mac y Linux (evita errores de "terraform fmt" y del pipeline)
+* text=auto eol=lf
+*.png binary
+*.svg text eol=lf

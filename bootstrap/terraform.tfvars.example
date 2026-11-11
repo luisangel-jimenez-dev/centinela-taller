@@ -1,0 +1,9 @@
+# 1. Copia este archivo:  cp terraform.tfvars.example terraform.tfvars
+# 2. Cambia los valores por los tuyos
+
+alumno      = "juan-perez"                  # minúsculas y guiones
+github_repo = "juanperez/centinela-sismos"  # tu usuario/tu-repo en GitHub
+
+# Si al aplicar te dice que el proveedor OIDC "already exists",
+# quita el # de la siguiente línea:
+# crear_proveedor_oidc = false
